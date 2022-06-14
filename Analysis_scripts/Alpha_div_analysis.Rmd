@@ -1,0 +1,343 @@
+---
+title: "16S Alpha Diversity Analysis"
+author: "Jacob T. Nearing"
+date: "2/15/2021"
+output: 
+  rmdformats::downcute:
+    self_contained: true
+    default_style: "light"
+    downcute_theme: "chaos"
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(emmeans)
+library(dplyr)
+library(broom)
+library(kableExtra)
+library(cowplot)
+library(reshape2)
+library(dunn.test)
+library(ggpubr)
+library(ggbeeswarm)
+library(FSA)
+colors <- c('ferrous bisglycinate'="#a09342", 'ferrous sulfate'="#9673c5", 'placebo'="#ba6d75")
+```
+
+# Introduction
+
+In this analysis we will examine the relationship between four different alpha diversity metrics and the use of iron supplementation in this cohort.
+
+We will examine:
+
+Richness: Examiens the total number of "unique" members identified.
+Evenness: How equally spread the abundance is across different members of the community
+Shannon diversity: Looks at both richness and evenness in a single metric
+Faith's phylogenetic diversity: Measures how phylogenetically related the community members are while also taking into their abundance
+
+```{r}
+Metadata <- read.table("~/projects/IRON_SUP_EMMA/Data/Metadata/Iron_Metadata_21_03_09.txt", header=T, sep="\t", row.names=1)
+
+## PD
+
+Faith_pd <- read.table("~/projects/IRON_SUP_EMMA/Data/diversity_5000/raw_alpha/faith_pd/alpha-diversity.tsv",
+                       row.names = 1, header=T)
+
+## evenness
+Evenness <- read.table("~/projects/IRON_SUP_EMMA/Data/diversity_5000/raw_alpha/evenness/alpha-diversity.tsv",
+                       row.names = 1, header=T)
+
+
+## shannon
+Shannon <- read.table("~/projects/IRON_SUP_EMMA/Data/diversity_5000/raw_alpha/shannon/alpha-diversity.tsv",
+                      row.names = 1, header=T)
+
+## raw_asvs
+Raw_ASVs <- read.table("~/projects/IRON_SUP_EMMA/Data/diversity_5000/raw_alpha/raw_ASVs/alpha-diversity.tsv",
+                       row.names = 1, header=T)
+
+
+Alpha_data <- cbind(Faith_pd, Evenness, Shannon, Raw_ASVs)
+
+Metadata_filter <- Metadata[rownames(Alpha_data),]
+```
+
+# Change in diversity metric {.tabset}
+## Faith's Dive
+
+```{r}
+comparisons <- list(c("ferrous bisglycinate\nn=40", "ferrous sulfate\nn=46"),
+                    c("ferrous bisglycinate\nn=40", "placebo\nn=47"),
+                    c("ferrous sulfate\nn=46", "placebo\nn=47"))
+comb_data <- cbind(Alpha_data, Metadata_filter)
+## we need to remove samples that do not have a match up... 
+
+faith_melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("faith_pd"))
+faith_melted_metadata_filt_filt <- faith_melted_metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=value[Week==12] - value[Week==0])
+
+#remove all week12
+faith_melted_metadat_pairwise <- faith_melted_metadata_filt_filt[-which(faith_melted_metadata_filt_filt$Week==12),]
+
+#faiths
+boxplot(faith_melted_metadat_pairwise$slope ~ faith_melted_metadat_pairwise$arm, xlab="Arm of Treatment", ylab="Change in Faith's PD")
+
+## make a nice ggplot for pub
+
+sample_size = faith_melted_metadat_pairwise %>% group_by(arm) %>% summarize(n())
+sample_size
+
+
+faith_melted_metadat_pairwise <- faith_melted_metadat_pairwise %>% 
+  left_join(sample_size) %>% 
+  left_join(data.frame(colors, arm=names(colors))) %>%
+  mutate(axis_name = paste0(arm, "\n", "n=", `n()`))
+
+faith_change_simple <- faith_melted_metadat_pairwise %>%
+  ggplot(aes(x=axis_name, y=slope)) +
+  geom_violin(alpha=0.3, aes(fill=colors)) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) +
+  scale_fill_identity() +
+  xlab("") +
+  ylab("Change in Faith's PD") +
+  #stat_compare_means(label.y=15, hide.ns=T) +
+  geom_quasirandom() +
+  theme_cowplot()
+
+faith_change_simple
+```
+
+
+Run pairwise wilcox test using placebo as reference group.
+
+### add manual dunn's stat results!
+
+```{r}
+faith_pairwise_res <- compare_means(slope ~ axis_name, data=faith_melted_metadat_pairwise,
+              p.adjust.method = "holm", method="wilcox.test", ref.group = "placebo\nn=47") %>% mutate(y.position=c(10,11))
+
+
+faith_change_simple + stat_pvalue_manual(faith_pairwise_res)
+
+### not significant!
+```
+
+
+## Shannon Diversity
+```{r}
+shannon_melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("shannon_entropy"))
+shannon_melted_metadata_filt_filt <- shannon_melted_metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=value[Week==12] - value[Week==0])
+
+#remove all week12
+shannon_melted_metadat_pairwise <- shannon_melted_metadata_filt_filt[-which(shannon_melted_metadata_filt_filt$Week==12),]
+
+#faiths
+boxplot(shannon_melted_metadat_pairwise$slope ~ shannon_melted_metadat_pairwise$arm, xlab="Arm", ylab="Change in Shannon Diversity")
+
+shannon_melted_metadat_pairwise <- shannon_melted_metadat_pairwise %>% 
+  left_join(sample_size) %>% 
+  left_join(data.frame(colors, arm=names(colors))) %>%
+  mutate(axis_name = paste0(arm, "\n", "n=", `n()`))
+
+shannon_change_simple <- shannon_melted_metadat_pairwise %>% 
+  ggplot(aes(x=axis_name, y=slope)) +
+  geom_violin(alpha=0.3, aes(fill=colors)) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) +
+  scale_fill_identity() +
+  xlab("") +
+  ylab("Change in Shannon Diversity") +
+  #stat_compare_means(label.y=7) +
+  geom_quasirandom() +
+  theme_cowplot()
+
+shannon_change_simple
+```
+
+```{r}
+shannon_pairwise_res <- compare_means(slope ~ axis_name, data=shannon_melted_metadat_pairwise,
+              p.adjust.method = "holm", method="wilcox.test", ref.group = "placebo\nn=47") %>% mutate(y.position=c(4,4.5))
+
+
+shannon_change_simple + stat_pvalue_manual(shannon_pairwise_res)
+
+```
+
+
+## Evenness
+```{r}
+even_melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("pielou_evenness"))
+even_melted_metadata_filt_filt <- even_melted_metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=value[Week==12] - value[Week==0])
+
+#remove all week12
+even_melted_metadat_pairwise <- even_melted_metadata_filt_filt[-which(even_melted_metadata_filt_filt$Week==12),]
+
+#faiths
+boxplot(even_melted_metadat_pairwise$slope ~ even_melted_metadat_pairwise$arm, xlab="Arm", ylab="Change in Evenness")
+
+even_melted_metadat_pairwise <- even_melted_metadat_pairwise %>% 
+  left_join(sample_size) %>% 
+  left_join(data.frame(colors, arm=names(colors))) %>%
+  mutate(axis_name = paste0(arm, "\n", "n=", `n()`))
+
+even_change_simple <- even_melted_metadat_pairwise %>% 
+  ggplot(aes(x=axis_name, y=slope)) +
+  geom_violin(alpha=0.3, aes(fill=colors)) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) +
+  scale_fill_identity() +
+  xlab("") +
+  ylab("Change in Evenness") +
+  #stat_compare_means(label.y=.75) +d
+  geom_quasirandom() + 
+  theme_cowplot()
+
+even_change_simple
+```
+
+```{r}
+even_pairwise_res <- compare_means(slope ~ axis_name, data=even_melted_metadat_pairwise,
+              p.adjust.method = "holm", method="wilcox.test", ref.group = "placebo\nn=47") %>% mutate(y.position=c(.7,.8))
+
+
+even_change_simple + stat_pvalue_manual(even_pairwise_res)
+## none are significant
+```
+
+
+## Richness
+```{r}
+rich_melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("observed_features"))
+rich_melted_metadata_filt_filt <- rich_melted_metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=value[Week==12] - value[Week==0])
+
+#remove all week12
+rich_melted_metadat_pairwise <- rich_melted_metadata_filt_filt[-which(rich_melted_metadata_filt_filt$Week==12),]
+
+#faiths
+boxplot(rich_melted_metadat_pairwise$slope ~ rich_melted_metadat_pairwise$arm, xlab="Arm", ylab="Change in Richness")
+
+
+rich_melted_metadat_pairwise <- rich_melted_metadat_pairwise %>% 
+  left_join(sample_size) %>% 
+  left_join(data.frame(colors, arm=names(colors))) %>%
+  mutate(axis_name = paste0(arm, "\n", "n=", `n()`))
+
+rich_change_simple <- rich_melted_metadat_pairwise %>% 
+  ggplot(aes(x=axis_name, y=slope)) +
+  geom_violin(alpha=0.3, aes(fill=colors)) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) +
+  scale_fill_identity() +
+  xlab("") +
+  ylab("Change in Richness") +
+  #stat_compare_means(label.y=250) +
+  geom_quasirandom() +
+  theme_cowplot()
+
+rich_change_simple
+```
+
+```{r}
+rich_pairwise_res <- compare_means(slope ~ axis_name, data=rich_melted_metadat_pairwise,
+              p.adjust.method = "holm", method="wilcox.test", ref.group = "placebo\nn=47") %>% mutate(y.position=c(165,185))
+
+
+rich_change_simple + stat_pvalue_manual(rich_pairwise_res)
+```
+
+## Publication figure
+
+```{r}
+Figure1_top_no_stats <- plot_grid(rich_change_simple, even_change_simple, nrow=1)
+Figure1_top_no_stats
+saveRDS(Figure1_top_no_stats, "~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Intermediate_RDS_files/Figure1_top_no_stats.RDS")
+
+
+
+Figure1_top_yes_stats <- plot_grid(rich_change_simple + stat_pvalue_manual(rich_pairwise_res),
+                                   even_change_simple + stat_pvalue_manual(even_pairwise_res),
+                                   nrow=1)
+Figure1_top_yes_stats
+saveRDS(Figure1_top_yes_stats, "~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Intermediate_RDS_files/Figure1_top_yes_stats.RDS")
+
+
+Supplemental_Fig1_no_stats <- plot_grid(rich_change_simple, even_change_simple, faith_change_simple, shannon_change_simple)
+
+ggsave(filename = "~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Supp_Figures/Supplemental_Figure1_no_stats.pdf",
+       plot=Supplemental_Fig1,
+       width=9,
+       height=10,
+       dpi=600)
+
+
+Supplemental_Fig1_yes_stats <- plot_grid(rich_change_simple + stat_pvalue_manual(rich_pairwise_res),
+                                         even_change_simple + stat_pvalue_manual(even_pairwise_res),
+                                         faith_change_simple + stat_pvalue_manual(faith_pairwise_res),
+                                         shannon_change_simple + stat_pvalue_manual(shannon_pairwise_res))
+
+ggsave(filename = "~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Supp_Figures/Supplemental_Figure1_yes_stats.pdf",
+       plot=Supplemental_Fig1_yes_stats,
+       width=9,
+       height=10,
+       dpi=600)
+```
+
+# Examination of complient individuals only
+
+```{r}
+Metadata_filter_comp <- Metadata_filter[which(Metadata_filter$Compliant==1),]
+Alpha_data_comp <- Alpha_data[rownames(Metadata_filter_comp),]
+
+```
+
+## Faith's Phylogenetic Diversity
+```{r}
+comb_data <- cbind(Alpha_data_comp, Metadata_filter_comp)
+## we need to remove samples that do not have a match up... 
+
+faith_melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("faith_pd"))
+faith_melted_metadata_filt_filt <- faith_melted_metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=value[Week==12] - value[Week==0])
+
+#remove all week12
+faith_melted_metadat_pairwise <- faith_melted_metadata_filt_filt[-which(faith_melted_metadata_filt_filt$Week==12),]
+
+#faiths
+boxplot(faith_melted_metadat_pairwise$slope ~ faith_melted_metadat_pairwise$arm, xlab="Arm of Treatment", ylab="Change in Faith's PD")
+```
+
+## Shannon Diversity
+```{r}
+shannon_melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("shannon_entropy"))
+shannon_melted_metadata_filt_filt <- shannon_melted_metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=value[Week==12] - value[Week==0])
+
+#remove all week12
+shannon_melted_metadat_pairwise <- shannon_melted_metadata_filt_filt[-which(shannon_melted_metadata_filt_filt$Week==12),]
+
+#faiths
+boxplot(shannon_melted_metadat_pairwise$slope ~ shannon_melted_metadat_pairwise$arm, xlab="Arm", ylab="Change in Shannon Diversity")
+```
+
+
+## Evenness
+```{r}
+even_melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("pielou_evenness"))
+even_melted_metadata_filt_filt <- even_melted_metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=value[Week==12] - value[Week==0])
+
+#remove all week12
+even_melted_metadat_pairwise <- even_melted_metadata_filt_filt[-which(even_melted_metadata_filt_filt$Week==12),]
+
+#faiths
+boxplot(even_melted_metadat_pairwise$slope ~ even_melted_metadat_pairwise$arm, xlab="Arm", ylab="Change in Evenness")
+```
+
+## Richness
+```{r}
+rich_melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("observed_features"))
+rich_melted_metadata_filt_filt <- rich_melted_metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=value[Week==12] - value[Week==0])
+
+#remove all week12
+rich_melted_metadat_pairwise <- rich_melted_metadata_filt_filt[-which(rich_melted_metadata_filt_filt$Week==12),]
+
+#faiths
+boxplot(rich_melted_metadat_pairwise$slope ~ rich_melted_metadat_pairwise$arm, xlab="Arm", ylab="Change in Richness")
+```

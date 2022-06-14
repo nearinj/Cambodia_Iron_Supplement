@@ -1,0 +1,195 @@
+---
+title: "QPCR_analysis"
+author: "Jacob T. Nearing"
+date: "09/06/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(lme4)
+library(broom)
+library(broom.mixed)
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+library(ggbeeswarm)
+
+
+colors <- c('ferrous bisglycinate'="#a09342", 'ferrous sulfate'="#9673c5", 'placebo'="#ba6d75")
+```
+
+```{r cars}
+#load in metadata
+metadata <- read.table("~/projects/IRON_SUP_EMMA/Data/Metadata/Iron_Metadata_21_03_09.txt", header=T, sep="\t", row.names=1)
+
+#load in qpcr data for baseline (week 0 samples)
+qpcr_data_inital <- as.data.frame(readxl::read_excel("~/projects/IRON_SUP_EMMA/qPCR_data/bfpa and eae results_CIT2.xlsx", sheet=1))
+qpcr_data_inital$individual <- qpcr_data_inital$ID
+qpcr_data_inital$ID <- paste0("b",qpcr_data_inital$ID)
+
+#load in qpcr data for endpoint (week 12 samples)
+qpcr_data_end <- as.data.frame(readxl::read_excel("~/projects/IRON_SUP_EMMA/qPCR_data/bfpa and eae results_CIT2.xlsx", sheet=2))
+qpcr_data_end$individual <- qpcr_data_end$ID
+qpcr_data_end$ID <- paste0("e", qpcr_data_end$ID)
+
+#bind them together
+qpcr_data_full <- rbind(qpcr_data_end, qpcr_data_inital)
+row.names(qpcr_data_full) <- qpcr_data_full$ID
+
+#filter to samples that have both a baseline and endpoint sample reading.
+metadata_filt <- metadata[rownames(qpcr_data_full),]
+metadata_filt <- metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% ungroup()
+
+qpcr_data_full <- qpcr_data_full %>% filter(individual %in% metadata_filt$Patint_ID)
+
+
+full_data <- cbind(metadata_filt, qpcr_data_full)
+
+# set reference groups
+full_data$`bfpA +/-` <- factor(full_data$`bfpA +/-`)
+full_data$`eae +/-` <- factor(full_data$`eae +/-`)
+
+
+full_data$Week <- factor(full_data$Week)
+
+full_data$arm <- factor(full_data$arm, levels=c("placebo", "ferrous bisglycinate", "ferrous sulfate"))
+
+
+## load in standards data
+bfpa_standard <- as.data.frame(readxl::read_excel("~/projects/IRON_SUP_EMMA/qPCR_data/standard curves - bfpa eae.xlsx", sheet=1))
+eae_standard <- as.data.frame(readxl::read_excel("~/projects/IRON_SUP_EMMA/qPCR_data/standard curves - bfpa eae.xlsx", sheet=2))
+```
+
+
+# Presence Abscene Analysis
+
+## Summary tables
+
+### bfpa
+```{r}
+grp_numbers <- full_data %>% group_by(arm,Week,arm) %>% summarize(cnt=n())
+grp_numbers
+
+bfpa <- full_data %>% group_by(arm, Week, `bfpA +/-`) %>% summarize(cnt=n())
+bfpa
+
+
+#get % postive in each grouping
+bfpa$cnt[1:4] <- bfpa$cnt[1:4]/56 * 100
+bfpa$cnt[5:8] <- bfpa$cnt[5:8]/53 * 100
+bfpa$cnt[9:12] <- bfpa$cnt[9:12]/57*100
+
+bfpa_pos <- bfpa %>% filter(`bfpA +/-`==1)
+bfpa_pos
+```
+
+### eae
+```{r}
+eae <- full_data %>% group_by(arm, Week, `eae +/-`) %>% summarize(cnt=n())
+eae
+
+eae$cnt[1:4] <- eae$cnt[1:4]/56 * 100
+eae$cnt[5:8] <- eae$cnt[5:8]/53 * 100
+eae$cnt[9:12] <- eae$cnt[9:12]/57 * 100
+
+eae_pos <- eae %>% filter(`eae +/-`==1)
+eae_pos
+```
+
+## Mixed effects logistic regression
+
+### eae presence abscene
+
+```{r}
+eae_melr <- glmer(`eae +/-` ~ Week*arm + (1|Patint_ID), data=full_data, family="binomial")
+eae_melr %>% tidy(conf.int=T)
+```
+
+### bfpa presence abscene
+```{r}
+bfpa_melr <- glmer(`bfpA +/-` ~ Week*arm + (1|Patint_ID), data=full_data, family="binomial")
+bfpa_melr %>% tidy(conf.int=T)
+```
+
+
+# Abundance analysis
+
+
+## eae
+
+### standard curve
+
+```{r}
+colnames(eae_standard)[7] <- "eae Cq"
+
+eae_standard$`eae Cq` <- as.numeric(eae_standard$`eae Cq`)
+eae_standard$`eae Cq`
+
+
+eae_lm  <- lm(`Log Starting Quantity` ~ `eae Cq`, data=eae_standard)
+summary(eae_lm)
+
+plot(eae_standard$`Log Starting Quantity` ~ eae_standard$`eae Cq`, xlab="Cq Value", ylab="Log Starting Quantity (ng)") 
+abline(eae_lm)
+```
+
+Use standard curve to calculate values in true dataset
+
+We will set log quantities to the detection limit for those samples that did not return a cq value.
+```{r}
+full_data$`eae Cq` <- as.numeric(full_data$`eae Cq`)
+full_data$`eae Cq`
+
+
+full_data$log_eae_ng <- predict(eae_lm, full_data)
+full_data$log_eae_ng
+
+full_data$log_eae_ng[which(is.na(full_data$log_eae_ng))] <- -4.6197888
+
+plot(full_data$log_eae_ng)
+```
+
+### Compare change in log_eae_ng between week 0 and week 12
+
+```{r}
+eae_change <- full_data  %>% group_by(Patint_ID) %>% arrange(Week) %>%
+  mutate("Change in log eae ng"=log_eae_ng - lag(log_eae_ng, default=NA)) %>% filter(Week==12) %>% ungroup
+
+sample_size <- eae_change %>% group_by(arm) %>% summarize(n())
+sample_size
+
+eae_change <- eae_change %>% 
+  left_join(sample_size) %>%
+  left_join(data.frame(colors, arm=names(colors))) %>%
+  mutate(myaxis=paste0(arm, "\n", "n=",`n()`))
+
+eae_change_plot <- eae_change %>% 
+  ggplot(aes(x=myaxis, y=`Change in log eae ng`)) +
+  geom_violin(alpha=0.3, aes(fill=colors)) +
+  geom_boxplot(fill="white", width=0.1, outlier.shape = NA) +
+  geom_quasirandom() +
+  xlab("") +
+  ylab("Change in log(eae qauntity, ng)") +
+  scale_fill_identity() +
+  theme_cowplot()
+  
+eae_change_plot  
+
+ggsave("~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Main_Figures/Figure5.pdf", plot=eae_change_plot,
+       width=11, height=9)
+```
+
+```{r}
+eae_change$test <- eae_change$`Change in log eae ng`
+
+pair_eae_change <- compare_means(test ~ myaxis, data=eae_change, p.adjust.method = "holm", 
+                               method="wilcox.test", ref.group = "placebo\nn=56") %>%
+  mutate(y.position=c(7,7.1))
+
+
+pair_eae_change
+eae_change_plot + stat_pvalue_manual(pair_eae_change)
+```

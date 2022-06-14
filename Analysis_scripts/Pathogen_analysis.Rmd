@@ -1,0 +1,345 @@
+---
+title: "Specifc Pathogen Analysis"
+author: "Jacob T. Nearing"
+date: "09/06/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(matrixStats)
+
+library(ggplot2)
+library(ggbeeswarm)
+library(cowplot)
+
+library(corncob)
+```
+
+
+```{r}
+Metadata <- read.table("~/projects/IRON_SUP_EMMA/Data/Metadata/Iron_Metadata_21_03_09.txt", header=T, sep="\t", row.names=1)
+
+phylum_table <- read.table("~/projects/IRON_SUP_EMMA/Data/TAXA_TABLES/phylum_table/feature-table.tsv", sep="\t", row.names=1,
+                           header = T, comment.char = "", skip=1)
+
+Metadata_filt <- Metadata[colnames(phylum_table),]
+
+Metadata_filt <- Metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2)
+
+Metadata_filt <- Metadata_filt %>%   mutate(sample_name=paste(ifelse(Week==0, "b", "e"),Patint_ID,sep=""))
+
+phylum_tab_filt <- phylum_table[,Metadata_filt$sample_name]
+```
+
+
+First we will look at the average phylum abundance across all samples
+
+
+```{r}
+phylum_tab_filt
+
+phylum_tab_filt_RA <- sweep(phylum_tab_filt, 2, colSums(phylum_tab_filt), '/')
+
+
+sort(rowMeans(phylum_tab_filt_RA) * 100)
+rowSds(as.matrix(phylum_tab_filt_RA))*100
+```
+
+
+# Specific pathogen analysis
+
+```{r}
+Genus_table <- read.table("~/projects/IRON_SUP_EMMA/Data/TAXA_TABLES/genus_table/genus_table.tsv", sep="\t", header=T, row.names=1, check.names = F,
+                          comment.char="", skip=1)
+
+Family_table <- read.table("~/projects/IRON_SUP_EMMA/Data/TAXA_TABLES/FAMILY_TABLE/FAMILY_TAB/feature-table.tsv", sep="\t", header=T,
+                           row.names=1, check.names = F, comment.char="", skip=1)
+
+Genus_tab_filt <- Genus_table[,Metadata_filt$sample_name]
+Family_tab_filt <- Family_table[,Metadata_filt$sample_name]
+
+
+Genus_tab_filt_RA <- sweep(Genus_tab_filt, 2, colSums(Genus_tab_filt), '/')
+Family_tab_filt_RA <- sweep(Family_tab_filt, 2, colSums(Family_tab_filt), '/')
+
+flip_Genus_tab_filt_RA <- data.frame(t(Genus_tab_filt_RA))
+flip_Family_tab_filt_RA <- data.frame(t(Family_tab_filt_RA))
+```
+
+## Standard classifcation with QIIME2
+
+### Camplyobacter
+```{r}
+grep("Camp", colnames(flip_Genus_tab_filt_RA))
+
+colnames(flip_Genus_tab_filt_RA)[53]
+
+summary(flip_Genus_tab_filt_RA[,53])
+table(flip_Genus_tab_filt_RA[,53], Metadata_filt$Week)
+
+
+grep("Camp", colnames(flip_Family_tab_filt_RA))
+table(flip_Family_tab_filt_RA[,53])
+
+#same at family level.
+```
+
+### Plesiomonas
+
+```{r}
+grep("Plesiomonas", colnames(flip_Genus_tab_filt_RA))
+colnames(flip_Genus_tab_filt_RA)[232]
+
+summary(flip_Genus_tab_filt_RA[,232])
+table(flip_Genus_tab_filt_RA[,232], Metadata_filt$Week, Metadata_filt$arm)
+```
+
+Not enough presence to do any real type of analysis between arms...
+
+### Escherichia/Shigella
+
+This has already been looked at in the previous DA analysis
+```{r}
+grep("Escherichia", colnames(flip_Genus_tab_filt_RA))
+colnames(flip_Genus_tab_filt_RA)[230]
+
+table(flip_Genus_tab_filt_RA[,230], Metadata_filt$Week)
+
+```
+
+### Salmonella
+
+```{r}
+searched_rows <- grep("nella", colnames(flip_Genus_tab_filt_RA))
+colnames(flip_Genus_tab_filt_RA)[searched_rows]
+```
+
+Not detected
+
+### Vibrio
+
+```{r}
+searched_rows <- grep("vibrio", ignore.case = T, colnames(flip_Genus_tab_filt_RA))
+colnames(flip_Genus_tab_filt_RA)[searched_rows]
+```
+
+Not detected
+
+### Yersinia
+
+```{r}
+searched_rows <- grep("y", ignore.case=T, colnames(flip_Genus_tab_filt_RA))
+colnames(flip_Genus_tab_filt_RA)[searched_rows]
+```
+
+Not detected
+
+### Enterobacteriaceae
+
+```{r}
+
+comb_data <- cbind(data.frame(Metadata_filt), flip_Family_tab_filt_RA)
+
+melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("d__Bacteria.p__Proteobacteria.c__Gammaproteobacteria.o__Enterobacterales.f__Enterobacteriaceae"))
+
+melted_metadata_filt_filt <- melted_metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=value[Week==0] - value[Week==12] > 0)
+
+
+diff_plot_RA <- ggplot(melted_metadata_filt_filt, aes(x=as.character(Week), y=log(value + 0.000001, base=10))) + 
+  geom_violin() +
+  geom_boxplot(aes(fill=Week), alpha=0.2, width=0.1, outlier.shape = NA) +
+  geom_point() +
+  geom_line(aes(color=slope, group=Patint_ID)) + facet_grid(~ arm) +
+  ylab("log10(RA Enterobacteriacae)") + xlab("Week of treatment") + 
+  scale_color_brewer(name="Direction of change", labels=c("Increase", "Decrease"), palette="Dark2") + 
+  theme_cowplot() +
+  guides(fill='none')
+
+diff_plot_RA
+
+
+melted_metadata_filt_filt$slope_name <- ifelse(melted_metadata_filt_filt$slope, "Decrease", "Increase")
+entero_table <- gridExtra::tableGrob(table(melted_metadata_filt_filt$slope_name, melted_metadata_filt_filt$arm)/2)
+entero_table <- ggdraw(entero_table)
+entero_table
+
+
+draw_final <- plot_grid(diff_plot_RA + theme(legend.position = "none"), entero_table,
+                        nrow=2,
+                        rel_heights = c(1,.5))
+draw_final <- plot_grid(draw_final, get_legend(diff_plot_RA),
+                        rel_widths = c(1,.4))
+draw_final
+```
+
+Test for significance using corncob
+
+```{r}
+Metadata_filt_df <- data.frame(Metadata_filt)
+rownames(Metadata_filt_df) <- Metadata_filt$sample_name
+
+grep("Enterobacter", rownames(Family_tab_filt))
+rownames(Family_tab_filt)[81:83]
+
+rownames(Family_tab_filt) <- paste0("OTU",seq(1:nrow(Family_tab_filt)))
+
+Metadata_filt_df$Week <- factor(Metadata_filt_df$Week, levels=c(0, 12))
+Metadata_filt_df$arm <- factor(Metadata_filt_df$arm, levels=c("placebo", "ferrous sulfate", "ferrous bisglycinate"))
+
+otu <- phyloseq::otu_table(Family_tab_filt, taxa_are_rows = T)
+sampledata <- phyloseq::sample_data(Metadata_filt_df)
+phylo <- phyloseq::merge_phyloseq(otu, sampledata)
+
+
+entero_test <- bbdml(formula = OTU82 ~ Week*arm,
+                     phi.formula = ~ Week*arm,
+                     data=phylo)
+entero_test
+
+entero_test <- bbdml(formula = OTU82 ~ Week*arm + Health_center,
+                     phi.formula = ~ Week*arm + Health_center,
+                     data=phylo)
+entero_test
+
+```
+
+
+# Analysis using sortme
+
+# Analysis using tophit classifers {.tabset}
+```{r}
+sortme_blast <- read.table("~/projects/IRON_SUP_EMMA/Data/SILVA_SORTME/out/aligned.blast", sep="\t")
+
+colnames(sortme_blast) <- c("ASV", "Hit_name", "pid", "length", "mismatch", "gapopen", "qstart", "qend",
+                            "sstart", "send", "evalue", "bitscore")
+
+silva_taxa_names <- read.table("/home/shared/rRNA_db/16S/SILVA_138/silva_tax/taxonomy.tsv", sep="\t", header=T)
+
+taxa_matchs <- match(sortme_blast$Hit_name, silva_taxa_names$Feature.ID)
+
+sortme_blast$Taxa <- silva_taxa_names$Taxon[taxa_matchs]
+
+
+ASV_table <- read.table("~/projects/IRON_SUP_EMMA/Data/deblur_output/Raw_data/feature-table.tsv", sep="\t", header=T, row.names = 1, check.names = F,
+                        comment.char = "", skip=1)
+
+ASV_table <- ASV_table[,Metadata_filt$sample_name]
+#convert to RA
+ASV_table_RA <- sweep(ASV_table, 2, colSums(ASV_table), '/')
+## okay now we need to collapse rows 
+ASV_match <- match(rownames(ASV_table), sortme_blast$ASV)
+
+ASV_table_RA$TAXA <- sortme_blast$Taxa[ASV_match]
+
+
+```
+
+
+## Salmonella
+```{r}
+salm_ASVs <- grep("Salmonella", ASV_table_RA$TAXA)
+ASV_table_RA$TAXA[salm_ASVs]
+
+Salmonella_table <- ASV_table_RA[salm_ASVs,]
+
+flip_Salmoennla_table <- data.frame(t(Salmonella_table[,-ncol(Salmonella_table)]))
+
+
+### get total Salmonella hits for each sample
+Total_salmonella <- colSums(Salmonella_table[,-ncol(Salmonella_table)])
+
+table(Total_salmonella, Metadata_filt$Week)
+
+
+seq_depths <- colSums(ASV_table)
+
+Salm_count_tab <- ASV_table[salm_ASVs,]
+
+Total_salm_counts <- colSums(Salm_count_tab)  
+
+length(Total_salm_counts)
+
+
+identical(names(Total_salm_counts), names(seq_depths))
+identical(names(Total_salm_counts), Metadata_filt$sample_name)
+
+Salm_test_df <- data.frame(W=Total_salm_counts,
+                           M=seq_depths,
+                           arm=Metadata_filt_df$arm,
+                           Week=Metadata_filt_df$Week,
+                           health_center=Metadata_filt_df$Health_center)
+
+
+Salm_bbdml <- bbdml(formula = cbind(W, M - W) ~ arm*Week,
+                    phi.formula = ~ arm*Week,
+                    data=Salm_test_df)
+
+
+Salm_bbdml
+```
+
+## Campylobacter
+```{r}
+camp_ASVS <- grep("Campylo", ASV_table_RA$TAXA, ignore.case = T)
+message("Number of ASVs classified as Campylobacter: ", length(camp_ASVS))
+
+camp_ASVS
+
+Camp_table <- ASV_table_RA[camp_ASVS,]
+
+flip_Camp_table <- data.frame(t(Camp_table[,-ncol(Camp_table)]))
+
+Total_camp <- colSums(Camp_table[, -ncol(Camp_table)])
+
+table(Total_camp, Metadata_filt$Week)
+
+```
+
+Only a single asv found in a single sample was classified as campylobacter at the genus level.
+
+## Vibrio analysis
+```{r}
+vibrio_ASVs <- grep("Vibrio", ASV_table_RA$TAXA, ignore.case = T)
+ASV_table_RA$TAXA[vibrio_ASVs]
+## still no hits
+```
+
+Lots of different vibrios but none that we are specifically interested in.
+
+## Plesiomonas
+```{r}
+Plesio_ASVs <- grep("Plesiomonas", ASV_table_RA$TAXA, ignore.case=T)
+ASV_table_RA$TAXA[Plesio_ASVs]
+
+Ples_table <- ASV_table_RA[Plesio_ASVs,]
+flip_Ples_table <- data.frame(t(Ples_table[,-ncol(Ples_table)]))
+
+Total_Ples <- colSums(Ples_table[, -ncol(Ples_table)])
+
+table(Total_Ples, Metadata_filt$Week)
+```
+
+
+## Yersina
+```{r}
+Yersina_ASVs <- grep("Yersinia", ASV_table_RA$TAXA, ignore.case=T)
+ASV_table_RA$TAXA[Yersina_ASVs]
+```
+
+No hits.
+
+## Escherichia
+
+```{r}
+Escherichia_ASVs <- grep("Escherichia", ASV_table_RA$TAXA, ignore.case = T)
+ASV_table_RA$TAXA[Escherichia_ASVs]
+
+Escherich_table <- ASV_table_RA[Escherichia_ASVs,]
+
+Total_Escherich <- colSums(Escherich_table[, -ncol(Escherich_table)])
+table(Total_Escherich, Metadata_filt$Week)
+
+```

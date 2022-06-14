@@ -1,0 +1,955 @@
+---
+title: "Differential Anundance Analysis"
+author: "Jacob T. Nearing"
+date: "3/2/2021"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    default_style: "light"
+    downcute_theme: "chaos"
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ALDEx2)
+library(lme4)
+library(lmerTest)
+library(broom)
+library(dplyr)
+library(kableExtra)
+library(corncob)
+library(cowplot)
+library(scales)
+library(ggplot2)
+library(ggbeeswarm)
+```
+
+```{r}
+ANCOM_mod = function(feature_table, meta_data, struc_zero = NULL, main_var, p_adj_method = "BH", 
+                 alpha = 0.05, adj_formula = NULL, rand_formula = NULL, fig=TRUE, ...){
+  # OTU table transformation: 
+  # (1) Discard taxa with structural zeros (if any); (2) Add pseudocount (1) and take logarithm.
+  if (!is.null(struc_zero)) {
+    num_struc_zero = apply(struc_zero, 1, sum)
+    comp_table = feature_table[num_struc_zero == 0, ]
+  }else{
+    comp_table = feature_table
+  }
+  comp_table = log(as.matrix(comp_table) + 1)
+  n_taxa = dim(comp_table)[1]
+  taxa_id = rownames(comp_table)
+  n_samp = dim(comp_table)[2]
+  
+  # Determine the type of statistical test and its formula.
+  if (is.null(rand_formula) & is.null(adj_formula)) {
+    # Basic model
+    # Whether the main variable of interest has two levels or more?
+    if (length(unique(meta_data%>%pull(main_var))) == 2) {
+      # Two levels: Wilcoxon rank-sum test
+      tfun = exactRankTests::wilcox.exact
+    } else{
+      # More than two levels: Kruskal-Wallis test
+      tfun = stats::kruskal.test
+    }
+    # Formula
+    tformula = formula(paste("x ~", main_var, sep = " "))
+  }else if (is.null(rand_formula) & !is.null(adj_formula)) {
+    # Model: ANOVA
+    tfun = stats::aov
+    # Formula
+    tformula = formula(paste("x ~", main_var, "+", adj_formula, sep = " "))
+  }else if (!is.null(rand_formula)) {
+    # Model: Mixed-effects model
+    tfun = nlme::lme
+    # Formula
+    if (is.null(adj_formula)) {
+      # Random intercept model
+      tformula = formula(paste("x ~", main_var))
+    }else {
+      # Random coefficients/slope model
+      tformula = formula(paste("x ~", main_var, "+", adj_formula))
+    }
+  }
+  
+  
+  if(grepl("\\*",main_var)){
+    main_var <- gsub("\\*",":", main_var)
+  }
+  # Calculate the p-value for each pairwise comparison of taxa.
+  p_data = matrix(NA, nrow = n_taxa, ncol = n_taxa)
+  colnames(p_data) = taxa_id
+  rownames(p_data) = taxa_id
+  for (i in 1:(n_taxa - 1)) {
+    # Loop through each taxon.
+    # For each taxon i, additive log ratio (alr) transform the OTU table using taxon i as the reference.
+    # e.g. the first alr matrix will be the log abundance data (comp_table) recursively subtracted 
+    # by the log abundance of 1st taxon (1st column) column-wisely, and remove the first i columns since:
+    # the first (i - 1) columns were calculated by previous iterations, and
+    # the i^th column contains all zeros.
+    alr_data = apply(comp_table, 1, function(x) x - comp_table[i, ]) 
+    # apply(...) allows crossing the data in a number of ways and avoid explicit use of loop constructs.
+    # Here, we basically want to iteratively subtract each column of the comp_table by its i^th column.
+    alr_data = alr_data[, - (1:i), drop = FALSE]
+    n_lr = dim(alr_data)[2] # number of log-ratios (lr)
+    alr_data = cbind(alr_data, meta_data) # merge with the metadata
+    
+    # P-values
+    if (is.null(rand_formula) & is.null(adj_formula)) {
+      p_data[-(1:i), i] = apply(alr_data[, 1:n_lr, drop = FALSE], 2, function(x){
+        tfun(tformula, data = data.frame(x, alr_data, check.names = FALSE))$p.value
+        }
+      ) 
+    }else if (is.null(rand_formula) & !is.null(adj_formula)) {
+      print(main_var)
+      p_data[-(1:i), i] = apply(alr_data[, 1:n_lr, drop = FALSE], 2, function(x){
+        fit = tfun(tformula, 
+                   data = data.frame(x, alr_data, check.names = FALSE), 
+                   na.action = na.omit)
+        summary(fit)[[1]][main_var, "Pr(>F)"]
+        }
+      )
+    }else if (!is.null(rand_formula)) {
+      p_data[-(1:i), i] = apply(alr_data[, 1:n_lr, drop = FALSE], 2, function(x){
+        fit = tfun(fixed = tformula, 
+                   data = data.frame(x, alr_data, check.names = FALSE),
+                   random = formula(rand_formula),
+                   na.action = na.omit, ...)
+        anova(fit)[main_var, "p-value"]
+        }
+      ) 
+    }
+  }
+  # Complete the p-value matrix.
+  # What we got from above iterations is a lower triangle matrix of p-values.
+  p_data[upper.tri(p_data)] = t(p_data)[upper.tri(p_data)]
+  diag(p_data) = 1 # let p-values on diagonal equal to 1
+  # Multiple comparisons correction.
+  q_data = apply(p_data, 2, function(x) p.adjust(x, method = p_adj_method))
+
+  # Calculate the W statistic of ANCOM.
+  # For each taxon, count the number of q-values < alpha.
+  W = apply(q_data, 2, function(x) sum(x < alpha))
+  
+  # Organize outputs
+  out_comp = data.frame(taxa_id, W, row.names = NULL, check.names = FALSE)
+  # Declare a taxon to be differentially abundant based on the quantile of W statistic.
+  # We perform (n_taxa - 1) hypothesis testings on each taxon, so the maximum number of rejections is (n_taxa - 1).
+  out_comp = out_comp%>%mutate(detected_0.9 = ifelse(W > 0.9 * (n_taxa -1), TRUE, FALSE),
+                               detected_0.8 = ifelse(W > 0.8 * (n_taxa -1), TRUE, FALSE),
+                               detected_0.7 = ifelse(W > 0.7 * (n_taxa -1), TRUE, FALSE),
+                               detected_0.6 = ifelse(W > 0.6 * (n_taxa -1), TRUE, FALSE))
+  # Taxa with structural zeros are automatically declared to be differentially abundant
+  if (!is.null(struc_zero)){
+    out = data.frame(taxa_id = rownames(struc_zero), W = Inf, detected_0.9 = TRUE, 
+                     detected_0.8 = TRUE, detected_0.7 = TRUE, detected_0.6 = TRUE, 
+                     row.names = NULL, check.names = FALSE)
+    out[match(taxa_id, out$taxa_id), ] = out_comp
+  }else{
+    out = out_comp
+  }
+  
+  
+  
+  if(fig==FALSE){
+    return(out)
+  }
+  # Draw volcano plot
+  # Calculate clr
+  clr_table = apply(feature_table, 2, clr)
+  # Calculate clr mean difference
+  eff_size = apply(clr_table, 1, function(y) 
+    lm(y ~ x, data = data.frame(y = y, 
+                                x = meta_data %>% pull(main_var),
+                                check.names = FALSE))$coef[-1])
+  
+  if (is.matrix(eff_size)){
+    # Data frame for the figure
+    dat_fig = data.frame(taxa_id = out$taxa_id, t(eff_size), y = out$W, check.names = FALSE) %>% 
+      mutate(zero_ind = factor(ifelse(is.infinite(y), "Yes", "No"), levels = c("Yes", "No"))) %>%
+      gather(key = group, value = x, rownames(eff_size))
+    # Replcace "x" to the name of covariate
+    dat_fig$group = sapply(dat_fig$group, function(x) gsub("x", paste0(main_var, " = "), x))
+    # Replace Inf by (n_taxa - 1) for structural zeros
+    dat_fig$y = replace(dat_fig$y, is.infinite(dat_fig$y), n_taxa - 1)
+    
+    fig = ggplot(data = dat_fig) + aes(x = x, y = y) + 
+      geom_point(aes(color = zero_ind)) + 
+      facet_wrap(~ group) +
+      labs(x = "CLR mean difference", y = "W statistic") +
+      scale_color_discrete(name = "Structural zero", drop = FALSE) + 
+      theme_bw() +
+      theme(plot.title = element_text(hjust = 0.5), legend.position = "top",
+            strip.background = element_rect(fill = "white"))
+    fig  
+  } else{
+    # Data frame for the figure
+    dat_fig = data.frame(taxa_id = out$taxa_id, x = eff_size, y = out$W) %>% 
+      mutate(zero_ind = factor(ifelse(is.infinite(y), "Yes", "No"), levels = c("Yes", "No")))
+    # Replace Inf by (n_taxa - 1) for structural zeros
+    dat_fig$y = replace(dat_fig$y, is.infinite(dat_fig$y), n_taxa - 1)
+    
+    fig = ggplot(data = dat_fig) + aes(x = x, y = y) + 
+      geom_point(aes(color = zero_ind)) + 
+      labs(x = "CLR mean difference", y = "W statistic") +
+      scale_color_discrete(name = "Structural zero", drop = FALSE) + 
+      theme_bw() +
+      theme(plot.title = element_text(hjust = 0.5), legend.position = "top")
+    fig
+  }
+  
+  res = list(out = out, fig = fig)
+  return(res)
+}
+```
+
+# Introductions
+
+In this markdown we will explore whether there are specific taxa associated with the different iron supplement treatments used in this trail.
+
+```{r}
+remove_rare_features <- function( table , cutoff_pro=0.1, parallel=1 ) {
+  if(cutoff_pro<=0){
+    message("No filtering will be done due to cutoff_pro set to 0 or below")
+    return(table)
+  }
+  row2keep <- c()
+  cutoff <- ceiling( cutoff_pro * ncol(table) )
+  if(parallel <= 1){
+    for ( i in 1:nrow(table) ) {
+      row_nonzero <- length( which( table[ i , ]  > 0 ) )
+      if ( row_nonzero > cutoff ) {
+        row2keep <- c( row2keep , i)
+      }
+    }
+    return( table [ row2keep , , drop=F ])
+  }else{
+    `%dopar%` <- foreach::`%dopar%`
+    cl <- parallel::makeCluster(parallel)
+    doParallel::registerDoParallel(cl)
+    message("Running with: ", foreach::getDoParWorkers(), " cores")
+
+    res <- foreach::foreach(i = 1:nrow(table), .combine = c) %dopar% {
+      row_nonzero <- length( which ( table[ i , ] > 0))
+      if(row_nonzero > cutoff){
+        i
+      }else
+        NULL
+    }
+    parallel::stopCluster(cl)
+    return( table[res, , drop=F])
+
+  }
+
+}
+
+```
+
+
+```{r}
+Metadata <- read.table("~/projects/IRON_SUP_EMMA/Data/Metadata/Iron_Metadata_21_03_09.txt", header=T, sep="\t", row.names=1)
+
+
+### Load taxa table
+Genus_table <- read.table("~/projects/IRON_SUP_EMMA/Data/TAXA_TABLES/genus_table/genus_table.tsv", sep="\t", header=T, row.names=1, check.names = F,
+                          comment.char="", skip=1)
+
+ASV_table <- read.table("~/projects/IRON_SUP_EMMA/Data/deblur_output/Raw_data/feature-table.tsv", sep="\t", header=T, row.names = 1, check.names = F,
+                        comment.char = "", skip=1)
+
+
+
+
+##only keep metadata from samples that sequenced sucessfully
+Metadata_filt <- Metadata[colnames(Genus_table),]
+Metadata_filt$arm_week <- paste(Metadata_filt$arm, Metadata_filt$Week, sep="_")
+Metadata_filt$arm <- relevel(Metadata_filt$arm, ref="placebo")
+Metadata_filt$Week <- as.factor(Metadata_filt$Week)
+
+Metadata_filt <- Metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2)
+dim(Metadata_filt)
+
+Metadata_filt <- Metadata_filt %>%  mutate(sample_name=paste(ifelse(Week==0, "b", "e"),Patint_ID,sep=""))
+
+ASV_table <- ASV_table[,Metadata_filt$sample_name]
+Genus_table <- Genus_table[,Metadata_filt$sample_name]
+
+#use these post-hoc.
+ASV_table_filt <- remove_rare_features(ASV_table, cutoff_pro = 0.05, parallel = 1)
+
+Keep_ASV <- rownames(ASV_table_filt)
+
+#use these post-hoc
+Genus_table_filt <- remove_rare_features(Genus_table, cutoff_pro = 0.05, parallel = 1)
+
+Keep_Genus <- rownames(Genus_table_filt)
+```
+
+
+
+```{r}
+Genus_RA <- sweep(Genus_table, 2, colSums(Genus_table), '/')
+
+flip_Genus_RA <- data.frame(t(Genus_RA))
+
+
+ASV_RA <- sweep(ASV_table, 2, colSums(ASV_table), '/')
+
+flip_ASV_RA <- data.frame(t(ASV_RA))
+
+
+CLR_table_ASV <- data.frame(apply(ASV_table_filt + 1, 2, function(x){log(x) - mean(log(x))}))
+flip_CLR_table_ASV <- data.frame(t(CLR_table_ASV))
+
+### convert to CLR 
+CLR_table <- data.frame(apply(Genus_table + 1, 2, function(x){log(x) - mean(log(x))}))
+CLR_table_flip <- data.frame(t(CLR_table))
+
+
+stopifnot(identical(rownames(CLR_table_flip), Metadata_filt$sample_name))
+```
+
+
+# ALDEx2 Analysis
+
+## Aldex2 all glm interaction
+
+This model is more appropriate and takes into the account the itneraction between being in different treatment groups and time since the start of treatment.
+
+### Genus
+```{r}
+Metadata_filt$arm <- relevel(Metadata_filt$arm, ref="placebo")
+
+MM <- model.matrix(~ arm + Week + arm*Week, data = Metadata_filt)
+inter_genus_clr <- aldex.clr(Genus_table, MM, mc.samples = 128)
+inter_genus_glm <- aldex.glm(inter_genus_clr, MM)
+
+
+#filter to genera found in at least 5% of samples
+inter_genus_glm <- inter_genus_glm[Keep_Genus,]
+
+
+#readjust p-value correction
+inter_genus_glm$`model.armferrous bisglycinate Pr(>|t|).BH` <- p.adjust(inter_genus_glm$`model.armferrous bisglycinate Pr(>|t|)`, method = "BH")
+inter_genus_glm$`model.armferrous sulfate Pr(>|t|).BH` <- p.adjust(inter_genus_glm$`model.armferrous sulfate Pr(>|t|)`, method="BH")
+
+min(inter_genus_glm$`model.armferrous bisglycinate Pr(>|t|).BH`)
+min(inter_genus_glm$`model.armferrous sulfate Pr(>|t|).BH`)
+
+
+saveRDS(inter_genus_glm, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/Genus_Aldex2.RDS")
+```
+
+
+Add in Health Center as a co-variate
+```{r}
+Metadata_filt$arm <- relevel(Metadata_filt$arm, ref="placebo")
+
+MM <- model.matrix(~ arm + Week + Health_center + arm*Week, data = Metadata_filt)
+inter_genus_clr <- aldex.clr(Genus_table, MM, mc.samples = 128)
+inter_genus_glm <- aldex.glm(inter_genus_clr, MM)
+
+
+#filter to genera found in at least 5% of samples
+inter_genus_glm <- inter_genus_glm[Keep_Genus,]
+
+
+#readjust p-value correction
+inter_genus_glm$`model.armferrous bisglycinate Pr(>|t|).BH` <- p.adjust(inter_genus_glm$`model.armferrous bisglycinate Pr(>|t|)`, method = "BH")
+inter_genus_glm$`model.armferrous sulfate Pr(>|t|).BH` <- p.adjust(inter_genus_glm$`model.armferrous sulfate Pr(>|t|)`, method="BH")
+
+min(inter_genus_glm$`model.armferrous bisglycinate Pr(>|t|).BH`)
+min(inter_genus_glm$`model.armferrous sulfate Pr(>|t|).BH`)
+
+
+saveRDS(inter_genus_glm, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/Genus_Aldex2_HC.RDS")
+```
+
+No significant results
+
+### ASV
+
+
+With HC
+```{r}
+inter_ASV_clr <- aldex.clr(ASV_table, MM, mc.samples = 128)
+inter_ASV_glm <- aldex.glm(inter_ASV_clr, MM)
+
+inter_ASV_glm <- inter_ASV_glm[Keep_ASV,]
+
+inter_ASV_glm$`model.armferrous bisglycinate Pr(>|t|).BH` <- p.adjust(inter_ASV_glm$`model.armferrous bisglycinate Pr(>|t|)`, "BH")
+inter_ASV_glm$`model.armferrous sulfate Pr(>|t|).BH` <- p.adjust(inter_ASV_glm$`model.armferrous sulfate Pr(>|t|)`, "BH")
+
+
+min(inter_ASV_glm$`model.armferrous bisglycinate Pr(>|t|).BH`)
+min(inter_ASV_glm$`model.armferrous sulfate Pr(>|t|).BH`)
+
+
+
+saveRDS(inter_ASV_glm, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/ASV_Aldex2_HC.RDS")
+
+```
+
+
+Without HC
+```{r}
+MM <- model.matrix(~ arm + Week + arm*Week, data = Metadata_filt)
+inter_ASV_clr <- aldex.clr(ASV_table, MM, mc.samples = 128)
+inter_ASV_glm <- aldex.glm(inter_ASV_clr, MM)
+
+inter_ASV_glm <- inter_ASV_glm[Keep_ASV,]
+
+inter_ASV_glm$`model.armferrous bisglycinate Pr(>|t|).BH` <- p.adjust(inter_ASV_glm$`model.armferrous bisglycinate Pr(>|t|)`, "BH")
+inter_ASV_glm$`model.armferrous sulfate Pr(>|t|).BH` <- p.adjust(inter_ASV_glm$`model.armferrous sulfate Pr(>|t|)`, "BH")
+
+
+min(inter_ASV_glm$`model.armferrous bisglycinate Pr(>|t|).BH`)
+min(inter_ASV_glm$`model.armferrous sulfate Pr(>|t|).BH`)
+
+
+
+saveRDS(inter_ASV_glm, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/ASV_Aldex2.RDS")
+
+```
+
+No Significant results.
+
+# Corncob Examination
+
+Corncob is a another tool used to identify microbes that might be associated with a specific group of interest.
+
+## All individuals
+
+### Gensus level analysis {.tabset}
+```{r}
+Metadata_filt$arm <- relevel(Metadata_filt$arm, ref="placebo")
+Metadata_filt$Week <- factor(Metadata_filt$Week, levels = c(0,12))
+
+Metadata_filt <- data.frame(Metadata_filt)
+rownames(Metadata_filt) <- Metadata_filt$sample_name
+
+otu <- phyloseq::otu_table(Genus_table, taxa_are_rows = T)
+sampledata <- phyloseq::sample_data(Metadata_filt)
+phylo <- phyloseq::merge_phyloseq(otu, sampledata)
+
+apply(phylo@otu_table, 1, FUN = function(x) wilcox.test(x ~ phylo@sam_data$Week))
+
+wilcox.test(phylo@otu_table ~ phylo@sam_data$Week)
+
+results_interact <- differentialTest(formula = ~ arm + Week + arm:Week,
+                                     phi.formula = ~ arm + Week + arm:Week,
+                                     phi.formula_null = ~ arm + Week + arm:Week,
+                                     formula_null = ~ arm + Week,
+                                     test="Wald", 
+                                     data=phylo,
+                                     boot=F,
+                                     fdr_cutoff = 0.1)
+
+saveRDS(results_interact, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/Genus_corncob.RDS")
+
+pvals <- results_interact$p
+pvals_filt <- pvals[names(pvals) %in% Keep_Genus]
+qvals_filt <- p.adjust(pvals_filt, "BH")
+
+min(qvals_filt, na.rm = T)
+
+which(qvals_filt < 0.1)
+
+
+plot(results_interact)
+```
+
+```{r}
+stopifnot(identical(rownames(Metadata_filt), rownames(flip_Genus_RA)))
+```
+
+
+```{r}
+sloop_function <- function(sloop_val){
+  
+  if(sloop_val==0){
+    return("Constant")
+  }else if(sloop_val > 0){
+    return("Decrease")
+  }else
+    return("Increase")
+  
+}
+
+```
+
+#### Enterococcus
+```{r}
+comb_data <- cbind(Metadata_filt, flip_Genus_RA)
+
+
+melted_metadata_filt <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("d__Bacteria.p__Firmicutes.c__Bacilli.o__Lactobacillales.f__Enterococcaceae.g__Enterococcus"))
+
+melted_metadata_filt_filt <- melted_metadata_filt %>% 
+  group_by(Patint_ID) %>% 
+  filter(n()==2) %>% 
+  mutate(slope=sloop_function(value[Week==0] - value[Week==12]))
+
+
+diff_plot_enterococcus <- ggplot(melted_metadata_filt_filt, aes(x=as.character(Week), y=log(value+0.00001, base=10))) + 
+  geom_violin() + 
+  geom_boxplot(aes(fill=Week), alpha=0.2, width=0.1) +
+  geom_point(alpha=0.5) +
+  geom_line(aes(color=slope, group=Patint_ID), alpha=.5) + facet_grid(~ arm) +
+  ylab("log10(Enterococcus RA.)") + xlab("Week of treatment") + 
+  scale_color_brewer(name="Direction of change", labels=c("Constant", "Decrease", "Increase"), palette="Dark2") + theme_cowplot() + 
+  guides(fill="none")
+
+diff_plot_enterococcus
+
+table_data_entero <- table(melted_metadata_filt_filt$slope, melted_metadata_filt_filt$arm)/2
+enterococcous_table <- gridExtra::tableGrob(table_data_entero)
+enterococcous_table <- ggdraw(enterococcous_table)
+enterococcous_table
+```
+
+#### Weissella
+```{r}
+comb_data <- cbind(Metadata_filt, flip_Genus_RA)
+
+melted_metadata_weissella <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("d__Bacteria.p__Firmicutes.c__Bacilli.o__Lactobacillales.f__Leuconostocaceae.g__Weissella"))
+
+melted_metadata_weissella_weissella <- melted_metadata_weissella %>% 
+  group_by(Patint_ID) %>% 
+  filter(n()==2) %>% 
+  mutate(slope=sloop_function(value[Week==0] - value[Week==12]))
+
+
+weissella_plot <- ggplot(melted_metadata_weissella_weissella, aes(x=as.character(Week), y=log(value + 0.00001, base = 10))) + 
+  geom_violin() +
+  geom_boxplot(aes(fill=Week), alpha=0.2, width=0.1) +
+  geom_point(alpha=0.5) + 
+  geom_line(aes(color=slope, group=Patint_ID), alpha=.5) + facet_grid(~ arm) +
+  ylab("log10(Weissella RA.)") + xlab("Week of treatment") + scale_color_brewer(name="Direction of change", labels=c("Constant", "Decrease", "Increase"), palette = "Dark2") + 
+  theme_cowplot() + guides(fill='none')
+
+
+weissella_plot
+
+weissella_table <- gridExtra::tableGrob(table(melted_metadata_weissella_weissella$slope, melted_metadata_weissella_weissella$arm)/2)
+weissella_table <- ggdraw(weissella_table)
+weissella_table
+```
+
+#### Escherichia-Shigella
+```{r}
+
+
+melted_metadata_escherichia <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("d__Bacteria.p__Proteobacteria.c__Gammaproteobacteria.o__Enterobacterales.f__Enterobacteriaceae.g__Escherichia.Shigella"))
+
+melted_metadata_escherichia_escherichia <- melted_metadata_escherichia %>% 
+  group_by(Patint_ID) %>% 
+  filter(n()==2) %>% 
+  mutate(slope=sloop_function(value[Week==0] - value[Week==12]))
+
+
+
+escherichia_plot <- ggplot(melted_metadata_escherichia_escherichia, aes(x=as.character(Week), y=log(value + 0.000001, base=10))) + 
+  geom_violin() +
+  geom_boxplot(aes(fill=Week), alpha=0.2, width=0.1) +
+  geom_point(alpha=0.4) + 
+  geom_line(aes(color=slope, group=Patint_ID), alpha=.5) + facet_grid(~ arm) +
+  ylab("log10(Escherichia-Shigella RA.)") + xlab("Week of treatment") +
+  scale_color_brewer(name="Direction of change", labels=c("Decrease", "Increase"), palette = "Dark2") + 
+  theme_cowplot() + guides(fill='none')
+
+escherichia_plot
+
+melted_metadata_escherichia_escherichia$slope <- factor(melted_metadata_escherichia_escherichia$slope, levels = c("Constant", "Decrease", "Increase"))
+
+
+escherichia_table <- gridExtra::tableGrob(table(melted_metadata_escherichia_escherichia$slope, melted_metadata_escherichia_escherichia$arm)/2)
+escherichia_table <- ggdraw(escherichia_table)
+escherichia_table
+```
+
+### Publication figure
+
+```{r}
+Figure3 <- plot_grid(diff_plot_enterococcus + theme(legend.position = "none"), 
+                     weissella_plot + theme(legend.position = "none"), 
+                     escherichia_plot + theme(legend.position = "none"), nrow=1)
+Figure3_bottom <- plot_grid(enterococcous_table, weissella_table, escherichia_table, nrow=1)
+Figure3_bottom
+
+Figure3_temp <- plot_grid(Figure3, Figure3_bottom, nrow=2,
+                          rel_heights = c(1,.25))
+Figure3_temp
+
+legend <- get_legend(diff_plot_enterococcus)
+legend
+Figure3_final <- plot_grid(Figure3_temp, legend, rel_widths = c(3,.4))
+Figure3_final
+
+ggsave("~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Main_Figures/Figure3.pdf", plot=Figure3_final,
+       width=9, height=11, units = "in")
+```
+
+
+### Genus with HC
+```{r}
+results_interact_HC <- differentialTest(formula = ~ arm + Week + arm:Week + Health_center,
+                                     phi.formula = ~ arm + Week + arm:Week + Health_center,
+                                     phi.formula_null = ~ arm + Week + arm:Week + Health_center,
+                                     formula_null = ~ arm + Week + Health_center,
+                                     test="Wald", 
+                                     data=phylo,
+                                     boot=F,
+                                     fdr_cutoff = 0.1)
+
+
+pvals <- results_interact_HC$p
+pvals_filt <- pvals[names(pvals) %in% Keep_Genus]
+qvals_filt <- p.adjust(pvals_filt, "BH")
+
+min(qvals_filt, na.rm = T)
+
+which(qvals_filt < 0.22)
+
+saveRDS(results_interact_HC, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/Genus_corncob_HC.RDS")
+```
+
+Doesn't pass significance after apply Health_Center as a control.
+
+
+
+
+### ASV analysis {.tabset}
+```{r}
+otu <- phyloseq::otu_table(ASV_table, taxa_are_rows = T)
+sampledata <- phyloseq::sample_data(Metadata_filt)
+phylo <- phyloseq::merge_phyloseq(otu, sampledata)
+
+results_ASV_interact <- differentialTest(formula = ~ arm + Week + arm:Week,
+                                     phi.formula = ~ arm + Week + arm:Week,
+                                     phi.formula_null = ~ arm + Week + arm:Week,
+                                     formula_null = ~ arm + Week,
+                                     test="Wald", data=phylo,
+                                     boot=F,
+                                     fdr_cutoff = 0.1)
+
+
+saveRDS(results_ASV_interact, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/ASV_corncob.RDS")
+
+
+pvals <- results_ASV_interact$p
+pvals_filt <- pvals[names(pvals) %in% Keep_ASV]
+qvals_filt <- p.adjust(pvals_filt, "BH")
+which.min(qvals_filt)
+
+```
+
+
+### ASV analysis with HC {.tabset}
+
+```{r}
+results_ASV_interact_HC <- differentialTest(formula = ~ arm + Week + arm:Week + Health_center,
+                                     phi.formula = ~ arm + Week + arm:Week + Health_center,
+                                     phi.formula_null = ~ arm + Week + arm:Week + Health_center,
+                                     formula_null = ~ arm + Week + Health_center,
+                                     test="Wald", data=phylo,
+                                     boot=F,
+                                     fdr_cutoff = 0.1)
+
+saveRDS(results_ASV_interact_HC, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/ASV_corncob_HC.RDS")
+
+
+
+pvals <- results_ASV_interact_HC$p
+pvals_filt <- pvals[names(pvals) %in% Keep_ASV]
+qvals_filt <- p.adjust(pvals_filt, "BH")
+which.min(qvals_filt)
+```
+
+### 83e3b434607e9ea107c21d0c9640cee2
+
+```{r}
+comb_data <- cbind(Metadata_filt, flip_ASV_RA)
+
+melted_metadata_83e3 <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("X83e3b434607e9ea107c21d0c9640cee2"))
+
+
+
+melted_metadata_83e3_83e3 <- melted_metadata_83e3 %>% 
+  group_by(Patint_ID) %>% filter(n()==2) %>% 
+  mutate(slope=sloop_function(value[Week==0] - value[Week==12]))
+
+
+
+X83e3_plot <- ggplot(melted_metadata_83e3_83e3, aes(x=as.character(Week), y=log(value + 0.000001, base=10))) + 
+  geom_violin() +
+  geom_boxplot(aes(fill=Week), alpha=0.2, width=0.1) +
+  geom_point(alpha=0.4) + 
+  geom_line(aes(color=slope, group=Patint_ID), alpha=.5) + facet_grid(~ arm) +
+  ylab("log10(ASV: C. perfringens RA.)") + xlab("Week of treatment") +
+  scale_color_brewer(name="Direction of change", labels=c("Constant","Decrease", "Increase"), palette = "Dark2") + 
+  theme_cowplot() + guides(fill='none')
+
+X83e3_plot
+
+X83e3_table <- gridExtra::tableGrob(table(melted_metadata_83e3_83e3$slope, melted_metadata_83e3_83e3$arm)/2)
+X83e3_table <- ggdraw(X83e3_table)
+X83e3_table
+
+```
+
+### b623615586e4850b4d1e433eabb8cec6
+
+```{r}
+melted_metadata_b623 <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("b623615586e4850b4d1e433eabb8cec6"))
+
+
+
+melted_metadata_b623_b623 <- melted_metadata_b623 %>% 
+  group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=sloop_function(value[Week==0] - value[Week==12]))
+
+
+
+b623_plot <- ggplot(melted_metadata_b623_b623, aes(x=as.character(Week), y=log(value + 0.000001, base=10))) + 
+  geom_violin() +
+  geom_boxplot(aes(fill=Week), alpha=0.2, width=0.1) +
+  geom_point(alpha=0.4) + 
+  geom_line(aes(color=slope, group=Patint_ID), alpha=.5) + facet_grid(~ arm) +
+  ylab("log10(E. coprostanoligenes RA.)") + xlab("Week of treatment") +
+  scale_color_brewer(name="Direction of change", labels=c("Constant","Decrease", "Increase"), palette = "Dark2") + 
+  theme_cowplot() + guides(fill='none')
+
+b623_plot
+
+
+b623_table <- gridExtra::tableGrob(table(melted_metadata_b623_b623$slope, melted_metadata_b623_b623$arm)/2)
+b623_table <- ggdraw(b623_table)
+b623_table
+```
+
+
+### 102807be929d5bfa1e0cd78ebaf5125f
+
+```{r}
+melted_metadata_X1028 <- reshape2::melt(comb_data, id.vars=c("Patint_ID", "Week", "arm"), measure.vars=c("X102807be929d5bfa1e0cd78ebaf5125f"))
+
+
+
+melted_metadata_X1028_X1028 <- melted_metadata_X1028 %>% 
+  group_by(Patint_ID) %>% filter(n()==2) %>% mutate(slope=sloop_function(value[Week==0] - value[Week==12]))
+
+
+
+X1028_plot <- ggplot(melted_metadata_X1028_X1028, aes(x=as.character(Week), y=log(value + 0.000001, base=10))) + 
+  geom_violin() +
+  geom_boxplot(aes(fill=Week), alpha=0.2, width=0.1) +
+  geom_point(alpha=0.4) + 
+  geom_line(aes(color=slope, group=Patint_ID), alpha=.5) + facet_grid(~ arm) +
+  ylab("log10(ASV: Bacteroides RA.)") + xlab("Week of treatment") +
+  scale_color_brewer(name="Direction of change", labels=c("Constant","Decrease", "Increase"), palette = "Dark2") + 
+  theme_cowplot() + guides(fill='none')
+
+X1028_plot
+
+
+X1028_table <- gridExtra::tableGrob(table(melted_metadata_X1028_X1028$slope, melted_metadata_X1028_X1028$arm)/2)
+X1028_table <- ggdraw(X1028_table)
+X1028_table
+```
+
+Supplemental Fig
+
+```{r}
+Figure_sup <- plot_grid(X83e3_plot + theme(legend.position = "none"), 
+                     X1028_plot + theme(legend.position = "none"), 
+                     b623_plot + theme(legend.position = "none"), nrow=1)
+
+Figure_sup_bottom <- plot_grid(X83e3_table, X1028_table, b623_table, nrow=1)
+Figure_sup_bottom
+
+Figure_sup_temp <- plot_grid(Figure_sup, Figure_sup_bottom, nrow=2,
+                          rel_heights = c(1,.25))
+Figure_sup_temp
+
+legend <- get_legend(X83e3_plot)
+legend
+
+
+Figure_sup_final <- plot_grid(Figure_sup_temp, legend, rel_widths = c(3,.4))
+Figure_sup_final
+
+```
+
+
+# Maaslin2
+
+## ASV
+```{r}
+library(Maaslin2)
+
+ASV_table_flip <- data.frame(t(ASV_table), check.rows = F, check.names = F)
+
+identical(rownames(Metadata_filt), rownames(ASV_table_flip))
+
+Metadata_filt$ferrous_bis_12 <- (Metadata_filt$arm=="ferrous bisglycinate") * (Metadata_filt$Week=="12")
+Metadata_filt$ferrous_sul_12 <- (Metadata_filt$arm=="ferrous sulfate") * (Metadata_filt$Week=="12")
+
+
+fit_data <- Maaslin2(input_data = ASV_table_flip,
+                     input_metadata = Metadata_filt,
+                     output="~/projects/IRON_SUP_EMMA/Data/Maaslin2_res_int",
+                     transform= "AST",
+                     fixed_effects = c("arm", "Week", "ferrous_bis_12", "ferrous_sul_12"))
+
+ferrous_bis_12_fit <- fit_data$results[grep("ferrous_bis_12", fit_data$results$name),]
+ferrous_sul_12_fit <- fit_data$results[grep("ferrous_sul_12", fit_data$results$name),]
+
+ferrous_bis_12_fit <- ferrous_bis_12_fit[ferrous_bis_12_fit$feature %in% Keep_ASV,]
+ferrous_bis_12_fit$qval_filt <- p.adjust(ferrous_bis_12_fit$pval, "BH")
+min(ferrous_bis_12_fit$qval_filt)
+
+
+ferrous_sul_12_fit <- ferrous_sul_12_fit[ferrous_sul_12_fit$feature %in% Keep_ASV,]
+ferrous_sul_12_fit$qval_filt <- p.adjust(ferrous_sul_12_fit$pval, "BH")
+ferrous_sul_12_fit$qval_filt
+
+```
+No Hits.
+
+## ASV with HC
+
+```{r}
+fit_data <- Maaslin2(input_data = ASV_table_flip,
+                     input_metadata = Metadata_filt,
+                     output="~/projects/IRON_SUP_EMMA/Data/Maaslin2_res_int",
+                     transform= "AST",
+                     fixed_effects = c("arm", "Week", "Health_center", "ferrous_bis_12", "ferrous_sul_12"))
+
+ferrous_bis_12_fit <- fit_data$results[grep("ferrous_bis_12", fit_data$results$name),]
+ferrous_sul_12_fit <- fit_data$results[grep("ferrous_sul_12", fit_data$results$name),]
+
+ferrous_bis_12_fit <- ferrous_bis_12_fit[ferrous_bis_12_fit$feature %in% Keep_ASV,]
+ferrous_bis_12_fit$qval_filt <- p.adjust(ferrous_bis_12_fit$pval, "BH")
+min(ferrous_bis_12_fit$qval_filt)
+
+
+ferrous_sul_12_fit <- ferrous_sul_12_fit[ferrous_sul_12_fit$feature %in% Keep_ASV,]
+ferrous_sul_12_fit$qval_filt <- p.adjust(ferrous_sul_12_fit$pval, "BH")
+ferrous_sul_12_fit$qval_filt
+
+```
+
+
+## Genus
+
+```{r}
+
+Genus_table_flip <- data.frame(t(Genus_table), check.rows = F, check.names = F)
+
+identical(rownames(Genus_table_flip), rownames(Metadata_filt))
+
+fit_data_genus <- Maaslin2(input_data = Genus_table_flip,
+                     input_metadata = Metadata_filt,
+                     output="~/projects/IRON_SUP_EMMA/Data/Maaslin2_res_genus",
+                     transform="AST",
+                     fixed_effects=c("arm","Week", "ferrous_bis_12", "ferrous_sul_12"))
+
+
+genus_ferrous_bis_12 <- fit_data_genus$results[grep("ferrous_bis_12", fit_data_genus$results$name),]
+genus_ferrous_sul_12 <- fit_data_genus$results[grep("ferrous_sul_12", fit_data_genus$results$name),]
+
+
+genus_ferrous_bis_12 <- genus_ferrous_bis_12[genus_ferrous_bis_12$feature %in% Keep_Genus,]
+genus_ferrous_bis_12$qval_filt <- p.adjust(genus_ferrous_bis_12$pval, "BH")
+genus_ferrous_bis_12$qval_filt
+
+
+genus_ferrous_sul_12 <- genus_ferrous_sul_12[genus_ferrous_sul_12$feature %in% Keep_Genus,]
+genus_ferrous_sul_12$qval_filt <- p.adjust(genus_ferrous_sul_12$pval, "BH")
+genus_ferrous_sul_12$qval_filt
+
+```
+No Hits.
+
+
+## Genus with HC
+
+```{r}
+fit_data_genus <- Maaslin2(input_data = Genus_table_flip,
+                     input_metadata = Metadata_filt,
+                     output="~/projects/IRON_SUP_EMMA/Data/Maaslin2_res_genus",
+                     transform="AST",
+                     fixed_effects=c("arm","Week", "Health_center", "ferrous_bis_12", "ferrous_sul_12"))
+
+
+genus_ferrous_bis_12 <- fit_data_genus$results[grep("ferrous_bis_12", fit_data_genus$results$name),]
+genus_ferrous_sul_12 <- fit_data_genus$results[grep("ferrous_sul_12", fit_data_genus$results$name),]
+
+
+genus_ferrous_bis_12 <- genus_ferrous_bis_12[genus_ferrous_bis_12$feature %in% Keep_Genus,]
+genus_ferrous_bis_12$qval_filt <- p.adjust(genus_ferrous_bis_12$pval, "BH")
+genus_ferrous_bis_12$qval_filt
+
+
+genus_ferrous_sul_12 <- genus_ferrous_sul_12[genus_ferrous_sul_12$feature %in% Keep_Genus,]
+genus_ferrous_sul_12$qval_filt <- p.adjust(genus_ferrous_sul_12$pval, "BH")
+genus_ferrous_sul_12$qval_filt
+
+```
+
+# ANCOM-II
+
+## ASV
+```{r}
+source("~/GitHub_Repos/Clean_Hackathon/Pipeline_scripts/Ancom2_Script/ancom_v2.1.R")
+
+Metadata_filt$samp_id <- rownames(Metadata_filt)
+
+prepro_asv <- feature_table_pre_process(feature_table=ASV_table,
+                                        meta_data = Metadata_filt, sample_var = 'samp_id', group_var = NULL, out_cut=0.05, zero_cut = 0.9, lib_cut = 1000, neg_lb=FALSE)
+
+res <- ANCOM_mod(feature_table = prepro_asv$feature_table, meta_data = prepro_asv$meta_data, struc_zero = prepro_asv$structure_zeros, main_var = "arm*Week",
+             p_adj_method = "BH", alpha=0.1, adj_formula = "arm + Week", rand_formula = NULL, fig=FALSE)
+
+saveRDS(res, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/ASV_ancomII.RDS")
+
+```
+
+## ASV with HC
+
+```{r}
+res <- ANCOM_mod(feature_table = prepro_asv$feature_table, meta_data = prepro_asv$meta_data, struc_zero = prepro_asv$structure_zeros, main_var = "arm*Week",
+             p_adj_method = "BH", alpha=0.1, adj_formula = "arm + Week + Health_center", rand_formula = NULL, fig=FALSE)
+
+
+saveRDS(res, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/ASV_ancomII_HC.RDS")
+```
+
+## Genus
+
+```{r}
+
+prepro_genus <- feature_table_pre_process(feature_table=Genus_table,
+                                        meta_data = Metadata_filt, sample_var = 'samp_id', group_var = NULL, out_cut=0.05, zero_cut = 0.9, lib_cut = 1000, neg_lb=FALSE)
+
+
+res_genus <- ANCOM_mod(feature_table = prepro_genus$feature_table, meta_data = prepro_genus$meta_data, 
+                       struc_zero = prepro_genus$structure_zeros, main_var = "arm*Week",
+             p_adj_method = "BH", alpha=0.1, adj_formula = "arm + Week", rand_formula = NULL, fig=FALSE)
+
+
+saveRDS(res_genus, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/Genus_ancomII.RDS")
+
+```
+
+## Genus with HC
+
+```{r}
+
+res_genus <- ANCOM_mod(feature_table = prepro_genus$feature_table, meta_data = prepro_genus$meta_data, 
+                       struc_zero = prepro_genus$structure_zeros, main_var = "arm*Week",
+             p_adj_method = "BH", alpha=0.1, adj_formula = "arm + Week + Health_center", rand_formula = NULL, fig=FALSE)
+
+saveRDS(res_genus, "~/GitHub_Repos/Cambodia_Iron_Supplement/DA_results/Genus_ancomII_HC.RDS")
+```

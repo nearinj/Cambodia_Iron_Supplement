@@ -1,0 +1,571 @@
+---
+title: "Beta Div. Analysis"
+author: "Jacob T. Nearing"
+date: "2/15/2021"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    default_style: "light"
+    downcute_theme: "chaos"
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(vegan)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(broom)
+library(kableExtra)
+library(reshape2)
+library(ggpubr)
+library(ggbeeswarm)
+
+colors <- c('ferrous bisglycinate'="#a09342", 'ferrous sulfate'="#9673c5", 'placebo'="#ba6d75")
+
+colors_weeks <- c('ferrous bisglycinate 0'="#a09342",
+                  'ferrous bisglycinate 12'="#d5be2e",
+                  'ferrous sulfate 0'="#9673c5",
+                  'ferrous sulfate 12'="#6f0bf7",
+                  'placebo 0'="#ba6d75",
+                  'placebo 12'="#fa0922")
+```
+
+# Introduction
+
+This analysis will examine whether there are overall changes in the microbial communities of individuals due to the use of different iron supplements.
+
+```{r}
+Metadata <- read.table("~/projects/IRON_SUP_EMMA/Data/Metadata/Iron_Metadata_21_03_09.txt", header=T, sep="\t", row.names=1)
+
+
+
+bray_curt <- read.table("~/projects/IRON_SUP_EMMA/Data/diversity_5000/beta_raw/bray_curt/distance-matrix.tsv", header=T, row.names = 1)
+
+
+weighted_uni <- read.table("~/projects/IRON_SUP_EMMA/Data/diversity_5000/beta_raw/weighted_unifrac/distance-matrix.tsv",
+                           header=T, row.names = 1)
+unweighted_uni <- read.table("~/projects/IRON_SUP_EMMA/Data/diversity_5000/beta_raw/unweighted_unifrac/distance-matrix.tsv",
+                             header=T, row.names = 1)
+
+Metadata_filt <- Metadata[rownames(weighted_uni),]
+
+Metadata_filt <- Metadata_filt %>% group_by(Patint_ID) %>% filter(n()==2)
+
+Metadata_week0 <- Metadata_filt %>% filter(Week==0) %>% 
+  mutate(test=Patint_ID) %>%
+  mutate(pair_dist_bray=bray_curt[paste("e",Patint_ID,sep=""), paste("b",Patint_ID,sep="")]) %>%
+  mutate(pair_dist_wuni=weighted_uni[paste("e",Patint_ID,sep=""), paste("b",Patint_ID,sep="")]) %>%
+  mutate(pair_dist_uuni=unweighted_uni[paste("e",Patint_ID,sep=""), paste("b",Patint_ID,sep="")]) %>% 
+  ungroup()
+
+sample_size <- Metadata_week0 %>% group_by(arm) %>% summarize(n())
+sample_size
+
+Metadata_week0 <- Metadata_week0 %>% left_join(data.frame(colors, arm=names(colors))) %>%
+  left_join(sample_size) %>% mutate(axis_name=paste(arm,"\nn=",`n()`,sep=""))
+
+```
+
+# Examination of Pairwise distances {.tabset}
+
+## Bray Curtis
+```{r warning=F}
+bray_distances <- ggplot(Metadata_week0, aes(x=axis_name, y=pair_dist_bray)) + 
+  geom_boxplot(fill="white", width=0.1, outlier.shape = NA) + 
+  geom_violin(alpha=0.3,aes(fill=colors)) +
+  geom_quasirandom() +
+  scale_fill_identity() + 
+  xlab("Treatment Arm") +
+  ylab("Bray-Curtis pairwise distance") + 
+  theme_cowplot()
+
+bray_distances
+```
+
+Add stats
+
+```{r}
+pair_bray_res <- compare_means(pair_dist_bray ~ axis_name, data=Metadata_week0, p.adjust.method = "holm", 
+                               method="wilcox.test", ref.group = "placebo\nn=47") %>%
+  mutate(y.position=c(1,1.1))
+
+bray_distances + stat_pvalue_manual(pair_bray_res)
+```
+
+
+## Weighted UniFrac
+```{r warning=F}
+wuni_distances <- ggplot(Metadata_week0, aes(x=axis_name, y=pair_dist_wuni)) + 
+  geom_boxplot(fill="white", width=0.1, outlier.shape = NA) + 
+  geom_violin(alpha=0.3,aes(fill=colors)) +
+  geom_quasirandom() +
+  scale_fill_identity() + 
+  xlab("Treatment Arm") +
+  ylab("Weighted UniFrac pairwise distance") + 
+  theme_cowplot()
+
+wuni_distances
+```
+
+Add stats
+
+```{r}
+pair_wuni_res <- compare_means(pair_dist_wuni ~ axis_name, data=Metadata_week0, p.adjust.method = "holm",
+                               method="wilcox.test", ref.group = "placebo\nn=47") %>%
+  mutate(y.position=c(1,1.1))
+
+wuni_distances + stat_pvalue_manual(pair_wuni_res)
+```
+
+## Unweighted UniFrac
+```{r warning=F}
+uuni_distances <-  ggplot(Metadata_week0, aes(x=axis_name, y=pair_dist_uuni)) + 
+  geom_boxplot(fill="white", width=0.1, outlier.shape = NA) + 
+  geom_violin(alpha=0.3,aes(fill=colors)) +
+  geom_quasirandom() +
+  scale_fill_identity() + 
+  xlab("Treatment Arm") +
+  ylab("Unweighted UniFrac pairwise distance") + 
+  theme_cowplot()
+
+uuni_distances
+```
+
+Add stats
+
+```{r}
+pair_uuni_res <- compare_means(pair_dist_uuni ~ axis_name, data=Metadata_week0, p.adjust.method="holm",
+                              method="wilcox.test", ref.group="placebo\nn=47") %>%
+  mutate(y.position=c(1,1.1))
+
+pair_uuni_res
+
+uuni_distances + stat_pvalue_manual(pair_uuni_res)
+```
+
+## Faceted pub plot
+
+```{r}
+plot_data <- Metadata_week0 %>% 
+  select(axis_name, pair_dist_bray, pair_dist_wuni, pair_dist_uuni, colors) %>%
+  melt()
+
+plot_data$variable <- recode_factor(plot_data$variable, 
+                                         pair_dist_wuni="Weighted UniFrac",
+                                         pair_dist_bray="Bray Curtis",
+                                         pair_dist_uuni="Unweighted UniFrac")
+
+pair_dist <- plot_data %>%
+  ggplot(aes(x=axis_name, y=value)) +
+  geom_violin(alpha=0.3, aes(fill=colors)) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) +
+  geom_quasirandom() +
+  facet_wrap(~ variable) +
+  scale_fill_identity() +
+  xlab("") +
+  ylab("Pairwise Distance") +
+  theme_cowplot()
+
+pair_dist
+```
+
+
+```{r}
+pair_bray_res$variable <- "Bray Curtis"
+pair_uuni_res$variable <- "Unweighted UniFrac"
+pair_wuni_res$variable <- "Weighted UniFrac"
+
+faceted_res <- do.call(rbind, list(pair_bray_res, pair_uuni_res, pair_wuni_res))
+
+
+pair_dist + stat_pvalue_manual(faceted_res)
+```
+
+
+```{r}
+Figure1_top_no_stats <- readRDS("~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Intermediate_RDS_files/Figure1_top_no_stats.RDS")
+Figure1_top_yes_stats <- readRDS("~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Intermediate_RDS_files/Figure1_top_yes_stats.RDS")
+
+Figure1_total_no_stats <- plot_grid(Figure1_top_no_stats, pair_dist, labels = c("A", "B"),
+                                    nrow=2)
+Figure1_total_no_stats
+
+ggsave(filename = "~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Main_Figures/Figure1.pdf",
+       plot=Figure1_total_no_stats,
+       width=10,
+       height=9,
+       dpi=600)
+
+Figure1_total_yes_stats <- plot_grid(Figure1_top_yes_stats,
+                                     pair_dist + stat_pvalue_manual(faceted_res), 
+                                     labels=c("A", "B"),
+                                     nrow = 2)
+Figure1_total_yes_stats
+
+ggsave(filename="~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Main_Figures/Figure1_stats.pdf",
+       plot=Figure1_total_yes_stats,
+       width=10,
+       height=9,
+       dpi=600)
+
+```
+
+# Exploration of treatment data using Pcoa/PERMANOVA {.tabset}
+
+First we will look at wether there is a significant interaction between week and arm to see if there is an effect on treatment. This is a second way of looking at a similar analysis as above and I would expect to receive similar results. The exepction to this is that the above analysis does not indicate the direction of the shift rather just the magnitude so this is another way to analysis the data taking into the account of the centroid and dispersion of the data.
+
+
+## Bray Curtis {.tabset}
+
+### All Weeks
+```{r warning=F}
+Metadata_filt <- Metadata_filt %>% 
+  mutate(arm_week=paste(arm,Week, sep=" ")) %>%
+  mutate(sample_name=paste(ifelse(Week==0, "b", "e"),Patint_ID,sep=""))
+
+Metadata_filt$arm_week
+
+bray_curt_filt <- bray_curt[Metadata_filt$sample_name, Metadata_filt$sample_name]
+
+bray_curt_pcoa <- cmdscale(bray_curt_filt, eig=T, k=2)
+comps_bray <- bray_curt_pcoa$eig/sum(bray_curt_pcoa$eig)*100
+
+bray_plot_data <- data.frame(PC1=bray_curt_pcoa$points[,1], PC2=bray_curt_pcoa$points[,2], class=Metadata_filt$arm_week, sample=Metadata_filt$Patint_ID)
+
+bray_plot_data <- left_join(bray_plot_data, data.frame(colors_weeks, class=names(colors_weeks)))
+bray_plot_data$Week <- grepl("12", bray_plot_data$class)
+bray_plot_data$Week <- ifelse(bray_plot_data$Week, "12", "0")
+
+bray_plot <- ggplot(bray_plot_data, aes(x=PC1, y=PC2, color=colors_weeks, group=sample, shape=Week)) + 
+  geom_point(size=3, alpha=0.8) + 
+  theme_classic() + 
+  #coord_fixed() + 
+  xlab("PC1 5.7%") +
+  ylab("PC2 4.7%") + 
+  scale_color_identity("Sample Type", labels=gsub("_", " ",names(colors_weeks)), guide="legend", breaks=colors_weeks) +
+  theme(plot.margin = margin(6, 0, 6, 0)) +
+  ggtitle("Bray-Curtis")
+  
+
+bray_plot
+
+
+
+
+
+#stop testing if the samples do not match up
+
+stopifnot(identical(rownames(bray_curt_filt), rownames(Metadata_filt$sample_name)))
+
+test <- adonis2(bray_curt_filt ~ arm*Week + Health_center, data=Metadata_filt, by="margin")
+test
+```
+
+Calculate change in PC1 between time points for each arm.
+
+```{r}
+
+Bray_diff_data <- bray_plot_data %>% 
+  group_by(sample) %>% 
+  filter(n() == 2) %>% 
+  mutate(PC1_diff=PC1[Week==12] - PC1[Week==0]) %>%
+  filter(Week==12)
+
+Bray_diff_data$class <- gsub(" 12", "",  Bray_diff_data$class)
+Bray_diff_data$class
+
+sample_size <- Bray_diff_data %>% group_by(class) %>% summarize(n())
+sample_size
+
+Bray_diff_data <- Bray_diff_data %>%
+  left_join(sample_size) %>%
+  left_join(data.frame(colors, class=names(colors))) %>%
+  mutate(axis_name= paste0(class, "\n", "n=",`n()`))
+
+Bray_diff_plot <- Bray_diff_data %>%
+  ggplot(aes(x=axis_name, y=PC1_diff)) +
+  geom_violin(alpha=0.3, aes(fill=colors)) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) +
+  geom_quasirandom() +
+  xlab("") +
+  ylab("Change in PC1") + 
+  ggtitle("Bray-Curtis") +
+  scale_fill_identity() +
+  theme_cowplot()
+  
+Bray_diff_plot
+```
+
+
+```{r}
+pair_bray_pc1_res <- compare_means(PC1_diff ~ axis_name, data=Bray_diff_data, p.adjust.method="holm",
+                              method="wilcox.test", ref.group="placebo\nn=47") %>%
+  mutate(y.position=c(1,1.1))
+
+pair_bray_pc1_res
+
+
+Bray_diff_plot + stat_pvalue_manual(pair_bray_pc1_res)
+```
+
+Examine differences by week
+
+```{r}
+
+bray_plot_week <- ggplot(bray_plot_data, aes(x=PC1, y=PC2, color=Week, group=Week)) + 
+  geom_point(size=3, alpha=0.8) + 
+  theme_classic() + 
+  #coord_fixed() + 
+  xlab("PC1 5.7%") +
+  ylab("PC2 4.7%") + 
+  theme(plot.margin = margin(6, 0, 6, 0)) +
+  ggtitle("Bray-Curtis") +
+  stat_ellipse() +
+  scale_color_manual(values=c("#a670b0", "#a58d48")) +
+  theme_cowplot()
+  
+
+bray_plot_week
+
+
+test <- adonis2(bray_curt_filt ~ Week + Health_center, data=Metadata_filt, by="margin")
+test
+```
+
+## Weighted UniFrac {.tabset}
+
+### All Weeks
+```{r warning=F}
+
+weighted_uni_filt <- weighted_uni[Metadata_filt$sample_name, Metadata_filt$sample_name]
+
+weighted_uni_pcoa <- cmdscale(weighted_uni_filt, eig=T, k=2)
+
+comps_wu <- weighted_uni_pcoa$eig/sum(weighted_uni_pcoa$eig)*100
+
+wu_plot_data <- data.frame(PC1=weighted_uni_pcoa$points[,1], PC2=weighted_uni_pcoa$points[,2], class=Metadata_filt$arm_week, sample=Metadata_filt$Patint_ID)
+
+wu_plot_data <- left_join(wu_plot_data, data.frame(colors_weeks, class=names(colors_weeks)))
+wu_plot_data$Week <- grepl("12", wu_plot_data$class)
+wu_plot_data$Week <- ifelse(wu_plot_data$Week, "12", "0")
+
+
+
+wu_plot <- ggplot(wu_plot_data, aes(x=PC1, y=PC2, color=colors_weeks, group=sample, shape=Week)) + 
+  geom_point(size=3, alpha=0.8) + 
+  theme_classic() + 
+  #coord_fixed() + 
+  xlab("PC1 56.1%") +
+  ylab("PC2 10.1%") + 
+  scale_color_identity("Sample Type", labels=gsub("_", " ",names(colors_weeks)), guide="legend", breaks=colors_weeks) +
+  theme(plot.margin = margin(6, 0, 6, 0)) +
+  ggtitle("Weighted UniFrac")
+
+wu_plot
+
+
+stopifnot(identical(rownames(weighted_uni_filt), Metadata_filt$sample_name))
+
+Adonis_test <- adonis2(weighted_uni_filt ~ arm*Week  + Health_center, data=Metadata_filt, by="margin")
+Adonis_test
+```
+
+
+```{r}
+wu_diff_data <- wu_plot_data %>% 
+  group_by(sample) %>% 
+  filter(n() == 2) %>% 
+  mutate(PC1_diff=PC1[Week==12] - PC1[Week==0]) %>%
+  filter(Week==12)
+
+wu_diff_data$class <- gsub(" 12", "",  wu_diff_data$class)
+wu_diff_data
+
+wu_diff_data <- wu_diff_data %>%
+  left_join(sample_size) %>%
+  left_join(data.frame(colors, class=names(colors))) %>%
+  mutate(axis_name= paste0(class, "\n", "n=",`n()`))
+  
+  
+wu_diff_plot <- wu_diff_data %>%
+  ggplot(aes(x=axis_name, y=PC1_diff)) +
+  geom_violin(alpha=0.3, aes(fill=colors)) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) +
+  geom_quasirandom() +
+  xlab("") +
+  ylab("Change in PC1") + 
+  ggtitle("Weighted UniFrac") +
+  scale_fill_identity() +
+  theme_cowplot()
+  
+
+
+wu_diff_plot
+```
+
+```{r}
+pair_wuni_pc1_res <- compare_means(PC1_diff ~ axis_name, data=wu_diff_data, p.adjust.method="holm",
+                              method="wilcox.test", ref.group="placebo\nn=47") %>%
+  mutate(y.position=c(1,1.1))
+
+pair_wuni_pc1_res
+
+wu_diff_plot + stat_pvalue_manual(pair_wuni_pc1_res)
+```
+
+
+```{r}
+wu_plot_week <- ggplot(wu_plot_data, aes(x=PC1, y=PC2, color=Week, group=Week)) + 
+  geom_point(size=3, alpha=0.8) + 
+  theme_classic() + 
+  #coord_fixed() + 
+  xlab("PC1 56.1%") +
+  ylab("PC2 10.1%") + 
+  theme(plot.margin = margin(6, 0, 6, 0)) +
+  ggtitle("Weighted UniFrac") +
+  stat_ellipse() +
+  scale_color_manual(values=c("#a670b0", "#a58d48")) +
+  theme_cowplot()
+
+wu_plot_week
+
+test <- adonis2(weighted_uni_filt ~ Week + Health_center, data=Metadata_filt, by="margin")
+test
+```
+
+## Unweighted UniFrac {.tabset}
+
+### All Weeks
+```{r warning=F}
+unweighted_uni_filt <- unweighted_uni[Metadata_filt$sample_name, Metadata_filt$sample_name]
+
+unweighted_uni_pcoa <- cmdscale(unweighted_uni_filt, eig=T, k=2)
+comps_unwu <- unweighted_uni_pcoa$eig/sum(unweighted_uni_pcoa$eig)*100
+
+unwu_plot_data <- data.frame(PC1=unweighted_uni_pcoa$points[,1], PC2=unweighted_uni_pcoa$points[,2], class=Metadata_filt$arm_week, sample=Metadata_filt$Patint_ID)
+
+
+unwu_plot_data <- left_join(unwu_plot_data, data.frame(colors_weeks, class=names(colors_weeks)))
+unwu_plot_data$Week <- grepl("12", unwu_plot_data$class)
+unwu_plot_data$Week <- ifelse(unwu_plot_data$Week, "12", "0")
+
+
+unwu_plot <- ggplot(unwu_plot_data, aes(x=PC1, y=PC2, color=colors_weeks, group=sample, shape=Week)) + 
+  geom_point(size=3, alpha=0.8) + 
+  theme_classic() + 
+  #coord_fixed() + 
+  xlab("PC1 9.5%") +
+  ylab("PC2 5.6%") + 
+  scale_color_identity("Sample Type", labels=gsub("_", " ",names(colors_weeks)), guide="legend", breaks=colors_weeks) +
+  theme(plot.margin = margin(6, 0, 6, 0)) +
+  ggtitle("Unweighted UniFrac")
+
+unwu_plot
+
+
+stopifnot(identical(rownames(unweighted_uni_filt), Metadata_filt$sample_name))
+
+unweighted_test <- adonis2(unweighted_uni_filt ~ arm*Week + Health_center, by="margin", data=Metadata_filt)
+unweighted_test
+
+```
+
+```{r}
+unwu_diff_data <- unwu_plot_data %>% 
+  group_by(sample) %>% 
+  filter(n() == 2) %>% 
+  mutate(PC1_diff=PC1[Week==12] - PC1[Week==0]) %>%
+  filter(Week==12)
+
+unwu_diff_data$class <- gsub(" 12", "",  unwu_diff_data$class)
+unwu_diff_data
+
+unwu_diff_data <- unwu_diff_data %>%
+  left_join(sample_size) %>%
+  left_join(data.frame(colors, class=names(colors))) %>%
+  mutate(axis_name= paste0(class, "\n", "n=",`n()`))
+
+unwu_diff_plot <- unwu_diff_data %>%
+  ggplot(aes(x=axis_name, y=PC1_diff)) +
+  geom_violin(alpha=0.3, aes(fill=colors)) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) +
+  geom_quasirandom() +
+  xlab("") +
+  ylab("Change in PC1") + 
+  ggtitle("Unweighted UniFrac") +
+  scale_fill_identity() +
+  theme_cowplot()
+  
+
+
+unwu_diff_plot
+```
+
+```{r}
+pair_unwu_pc1_res <- compare_means(PC1_diff ~ axis_name, data=unwu_diff_data, p.adjust.method="holm",
+                              method="wilcox.test", ref.group="placebo\nn=47") %>%
+  mutate(y.position=c(1,1.1))
+
+pair_unwu_pc1_res
+
+unwu_diff_plot + stat_pvalue_manual(pair_unwu_pc1_res)
+```
+
+Examine by week
+
+```{r}
+unwu_plot_week <- ggplot(unwu_plot_data, aes(x=PC1, y=PC2, color=Week, group=Week)) + 
+  geom_point(size=3, alpha=0.8) + 
+  theme_classic() + 
+  #coord_fixed() + 
+  xlab("PC1 9.5%") +
+  ylab("PC2 5.6%") + 
+  theme(plot.margin = margin(6, 0, 6, 0)) +
+  ggtitle("Unweighted UniFrac") +
+  stat_ellipse() +
+  scale_color_manual(values=c("#a670b0", "#a58d48")) +
+  theme_cowplot()
+
+unwu_plot_week
+
+test <- adonis2(unweighted_uni_filt ~ Week + Health_center, data=Metadata_filt, by="margin")
+test
+```
+
+
+## Publication Figure
+
+```{r}
+Figure2_top_temp <- plot_grid(bray_plot + theme(legend.position = "none"),
+                         wu_plot + theme(legend.position = "none"),
+                         unwu_plot + theme(legend.position = "none"),
+                         nrow=1)
+legend <- get_legend(bray_plot + theme(legend.box.margin = margin(0,0,0,12)))
+legend
+
+Figure2_top <- plot_grid(Figure2_top_temp, legend, rel_widths = c(3, .4))
+Figure2_top
+
+
+Figure2_bottom <- plot_grid(Bray_diff_plot, wu_diff_plot, unwu_diff_plot, nrow=1)
+Figure2_bottom
+
+Figure2 <- plot_grid(Figure2_top, Figure2_bottom, nrow=2)
+Figure2
+
+ggsave(filename = "~/GitHub_Repos/Cambodia_Iron_Supplement/Display_items/Main_Figures/Figure2.pdf",
+       plot=Figure2,
+       width=10,
+       height=9,
+       dpi=600)
+```
+
+
+```{r}
+Supp_fig <- plot_grid(bray_plot_week, wu_plot_week, unwu_plot_week, nrow=1,
+                      labels=c("A", "B", "C"))
+Supp_fig
+```
